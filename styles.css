@@ -1,0 +1,80 @@
+:root { --bg:#0a0a0a; --accent:#3a4c7a; }
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  overflow: hidden;
+  font-family: Arial, sans-serif;
+  background: var(--bg);
+  color: black;
+}
+
+#controls {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  background: rgba(0,0,0,.6);
+  padding: 10px;
+  border-radius: 8px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+}
+
+#topicInput {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #333;
+  width: 220px;
+  background: #111;
+  color: #eee;
+}
+
+#generateBtn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 0;
+  cursor: pointer;
+  background: var(--accent);
+  font-weight: 700;
+}
+
+#graph {
+  width: 100vw;
+  height: 100vh;
+}
+
+/* Overlay info panel */
+#infoCard {
+  position: fixed;   /* sits above the canvas */
+  right: 12px;
+  top: 12px;
+  z-index: 100;
+  width: 340px;
+  max-height: 70vh;
+  overflow: auto;
+  background: rgba(0,0,0,.75);
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45);
+}
+#infoCard h3 { margin: 0 0 8px 0; font-size: 16px; color: #00ff88; }
+#infoCard p  { margin: 6px 0; color: #ddd; line-height: 1.35; }
+#infoCard a  { color: #58c7ff; text-decoration: none; }
+#infoCard ul { padding-left: 18px; margin: 6px 0; }
+#infoCard li { margin-bottom: 6px; }
+
+#closeCard {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  border: 0;
+  background: transparent;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 16px;
+}
+#closeCard:hover { color: #fff; }
