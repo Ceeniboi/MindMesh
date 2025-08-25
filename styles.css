@@ -1,4 +1,4 @@
-:root { --bg:#0a0a0a; --accent:#3a4c7a; }
+:root { --bg:#0a0a0a; --accent:#3a4c7a; --accent2:#00ff88; --border:#2a2a2a; }
 html, body { height: 100%; }
 
 body {
@@ -9,6 +9,7 @@ body {
   color: black;
 }
 
+/* Controls */
 #controls {
   position: absolute;
   top: 10px;
@@ -22,7 +23,6 @@ body {
   align-items: center;
   box-shadow: 0 4px 14px rgba(0,0,0,.35);
 }
-
 #topicInput {
   padding: 6px 8px;
   border-radius: 6px;
@@ -31,7 +31,6 @@ body {
   background: #111;
   color: #eee;
 }
-
 #generateBtn {
   padding: 6px 10px;
   border-radius: 6px;
@@ -41,31 +40,30 @@ body {
   font-weight: 700;
 }
 
-#graph {
-  width: 100vw;
-  height: 100vh;
-}
+/* Graph */
+#graph { width: 100vw; height: 100vh; }
 
-/* Overlay info panel */
+/* Info Card */
 #infoCard {
-  position: fixed;   /* sits above the canvas */
+  position: fixed;
   right: 12px;
   top: 12px;
   z-index: 100;
-  width: 340px;
-  max-height: 70vh;
+  width: 420px;
+  max-height: 84vh;
   overflow: auto;
-  background: rgba(0,0,0,.75);
-  border: 1px solid #2a2a2a;
+  background: rgba(0,0,0,.85);
+  border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 12px;
+  padding: 12px 12px 16px 12px;
   box-shadow: 0 10px 30px rgba(0,0,0,.45);
 }
-#infoCard h3 { margin: 0 0 8px 0; font-size: 16px; color: #00ff88; }
+#infoCard h3 { margin: 0 0 8px 0; font-size: 16px; color: var(--accent2); }
 #infoCard p  { margin: 6px 0; color: #ddd; line-height: 1.35; }
 #infoCard a  { color: #58c7ff; text-decoration: none; }
 #infoCard ul { padding-left: 18px; margin: 6px 0; }
-#infoCard li { margin-bottom: 6px; }
+#infoCard li { margin-bottom: 6px; color: #e8e8e8; }
+#infoCard h4 { margin: 10px 0 6px; color: #cfe5ff; font-size: 13px; }
 
 #closeCard {
   position: absolute;
@@ -78,3 +76,103 @@ body {
   font-size: 16px;
 }
 #closeCard:hover { color: #fff; }
+.muted { color: #bbb; }
+.sec { border-top: 1px solid rgba(255,255,255,.06); padding-top: 8px; margin-top: 8px; }
+
+/* Tabs */
+.tabs {
+  position: sticky;         /* stays in view when panel scrolls */
+  top: 0;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 6px 0 10px 0;
+  padding-bottom: 6px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.9), rgba(0,0,0,0.6));
+  backdrop-filter: saturate(120%) blur(2px);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* Tab pills */
+.tab-btn {
+  appearance: none;
+  border: 1px solid rgba(120,140,170,0.28);
+  background: linear-gradient(180deg, #0d1422, #0a0f1a);
+  color: #d7e6ff;
+  padding: 8px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 12px;
+  letter-spacing: .2px;
+  transition: transform .06s ease, box-shadow .15s ease, border-color .2s ease, background .2s ease;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 4px 10px rgba(0,0,0,0.25);
+}
+
+.tab-btn:hover {
+  transform: translateY(-1px);
+  border-color: rgba(140,170,220,0.55);
+  box-shadow: 0 2px 0 rgba(255,255,255,0.06) inset, 0 8px 18px rgba(0,0,0,0.35);
+}
+
+.tab-btn:focus-visible {
+  outline: 2px solid #58c7ff;
+  outline-offset: 2px;
+}
+
+/* Active pill */
+.tab-btn.active {
+  color: #e9fff6;
+  border-color: rgba(0,255,136,0.6);
+  background: linear-gradient(180deg, rgba(0,255,136,0.14), rgba(0,255,136,0.08) 60%, #0a121e);
+  box-shadow: 0 0 0 1px rgba(0,255,136,0.22) inset, 0 8px 20px rgba(0,255,136,0.10);
+}
+
+/* (Optional) tighter grid on narrow screens */
+@media (max-width: 440px) {
+  .tabs { grid-template-columns: repeat(2, minmax(0,1fr)); }
+}
+
+/* Panels */
+.tab-panel[hidden] { display: none !important; }
+
+/* Papers/quotes styles */
+.list-papers .year { color: #a8b6d9; }
+.list-papers .why  { color: #d9dde6; margin-top: 2px; }
+.quotes blockquote {
+  margin: 0 0 10px 0;
+  padding: 8px 10px;
+  background: rgba(10,16,28,.8);
+  border: 1px dashed #2a2a2a;
+  border-radius: 8px;
+}
+.quotes blockquote p { margin: 0 0 6px 0; color: #e8f0ff; }
+.quotes blockquote cite { color: #a7b0bf; font-style: normal; }
+
+/* Prompts */
+.prompts code {
+  background: #0c1221;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: #d7e0ff;
+}
+.prompts .out { margin-left: 8px; text-decoration: none; color: #58c7ff; }
+
+/* Timeline */
+.timeline .badge {
+  display: inline-block;
+  min-width: 42px;
+  text-align: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #152035;
+  border: 1px solid #2a2a2a;
+  color: #d3e4ff;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-tab indeterminate loading bar */
+.progress { display:none; height: 4px; background: rgba(255,255,255,.08); border-radius: 999px; overflow: hidden; margin: 4px 0 8px; }
+.progress .bar { height: 100%; width: 40%; background: linear-gradient(90deg,#58c7ff,#00ff88); border-radius: 999px; animation: indet 1.2s infinite; }
+@keyframes indet { 0% { margin-left:-40%; } 100% { margin-left:100%; } }

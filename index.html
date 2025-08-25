@@ -16,12 +16,89 @@
   <!-- Graph container (full-viewport) -->
   <div id="graph"></div>
 
-  <!-- Info card (keep outside #graph so it isn’t wiped by WebGL) -->
+  <!-- Info card (kept outside #graph so it isn’t wiped by WebGL) -->
   <aside id="infoCard" style="display:none;">
     <button id="closeCard">✕</button>
     <h3 id="cardTitle">Title</h3>
-    <p id="cardSummary">Summary</p>
-    <div id="cardSources"></div>
+    <p id="cardSummary" class="muted">Click a node to load its dossier.</p>
+
+    <!-- Tabs header -->
+    <nav id="tabBar" class="tabs">
+      <button class="tab-btn active" data-tab="overview">Overview</button>
+      <button class="tab-btn" data-tab="key_ideas">Key Ideas</button>
+      <button class="tab-btn" data-tab="aliases">Aliases</button>
+      <button class="tab-btn" data-tab="papers">Papers</button>
+      <button class="tab-btn" data-tab="quotes">Quotes</button>
+      <button class="tab-btn" data-tab="datasets_tools">Datasets/Tools</button>
+      <button class="tab-btn" data-tab="controversies">Controversies</button>
+      <button class="tab-btn" data-tab="search_prompts">Search</button>
+      <button class="tab-btn" data-tab="timeline">Timeline</button>
+    </nav>
+
+    <!-- Panels (one per tab) -->
+    <div class="tab-panel" data-tab="overview">
+      <div class="progress" id="prog-overview"><div class="bar"></div></div>
+      <section class="sec">
+        <h4>Definition</h4>
+        <p id="cardDefinition">—</p>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="key_ideas" hidden>
+      <div class="progress" id="prog-key_ideas"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardKeyIdeas"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="aliases" hidden>
+      <div class="progress" id="prog-aliases"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardAliases"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="papers" hidden>
+      <div class="progress" id="prog-papers"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardPapers" class="list-papers"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="quotes" hidden>
+      <div class="progress" id="prog-quotes"><div class="bar"></div></div>
+      <section class="sec">
+        <div id="cardQuotes" class="quotes"></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="datasets_tools" hidden>
+      <div class="progress" id="prog-datasets_tools"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardDatasets"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="controversies" hidden>
+      <div class="progress" id="prog-controversies"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardControversies"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="search_prompts" hidden>
+      <div class="progress" id="prog-search_prompts"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardPrompts" class="prompts"></ul>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab="timeline" hidden>
+      <div class="progress" id="prog-timeline"><div class="bar"></div></div>
+      <section class="sec">
+        <ul id="cardTimeline" class="timeline"></ul>
+      </section>
+    </div>
   </aside>
 
   <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
