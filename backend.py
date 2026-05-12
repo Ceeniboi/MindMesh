@@ -1,6 +1,9 @@
 from pathlib import Path
 from dotenv import load_dotenv
-import os, json, re, requests
+from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import os, json, re, time, requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
@@ -46,13 +49,26 @@ def _trim_6000(s: str) -> str:
     return (s[:6000].rsplit(".", 1)[0] + ".") if "." in s[:6000] else s[:6000]
 
 # ---------------------------
-# Wikipedia context
+# Wikipedia context (with TTL cache to avoid refetching per node click)
 # ---------------------------
+_WIKI_CACHE: dict[str, tuple[float, str]] = {}
+_WIKI_TTL_SEC = 60 * 30  # 30 min
+
+def _wiki_title(topic: str) -> str:
+    # Wikipedia accepts spaces-as-underscores; URL-encode to handle '#', '/', '?', etc.
+    return quote(topic.strip().replace(" ", "_"), safe="_")
+
 def fetch_context(topic: str) -> str:
-    title = topic.strip().replace(" ", "_")
+    key = topic.strip().lower()
+    now = time.time()
+    cached = _WIKI_CACHE.get(key)
+    if cached and now - cached[0] < _WIKI_TTL_SEC:
+        return cached[1]
+
+    title = _wiki_title(topic)
     parts = []
     try:
-        r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}", timeout=10)
+        r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}", timeout=8)
         if r.ok:
             s = r.json().get("extract", "")
             if s: parts.append(s)
@@ -60,7 +76,7 @@ def fetch_context(topic: str) -> str:
         print("Wiki summary error:", e)
 
     try:
-        rel = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/related/{title}", timeout=10)
+        rel = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/related/{title}", timeout=8)
         if rel.ok:
             pages = rel.json().get("pages", [])[:2]
             for p in pages:
@@ -70,43 +86,64 @@ def fetch_context(topic: str) -> str:
         print("Wiki related error:", e)
 
     combined = "\n".join(parts).strip()
-    return _trim_6000(combined if combined else topic)
+    out = _trim_6000(combined if combined else topic)
+    _WIKI_CACHE[key] = (now, out)
+    return out
+
+def fetch_wiki_summary(title: str) -> str:
+    """Single-page wiki summary by exact title; safe fallback to title."""
+    t = _wiki_title(title)
+    try:
+        r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{t}", timeout=6)
+        if r.ok:
+            return r.json().get("extract", "") or title
+    except Exception as e:
+        print("Wiki node summary error:", e)
+    return title
+
 
 # ---------------------------
 # Crossref & arXiv sources
 # ---------------------------
 def fetch_crossref(query: str, rows: int = 6):
-    url = "https://api.crossref.org/works"
+    endpoint = "https://api.crossref.org/works"
     params = { "query": query, "rows": rows, "select": "title,URL,author,issued,type" }
     out = []
     try:
-        r = requests.get(url, params=params, timeout=12)
+        r = requests.get(endpoint, params=params, timeout=8)
         if r.ok:
             items = r.json().get("message", {}).get("items", [])
             for it in items:
                 title = (it.get("title") or [""])[0]
-                url = it.get("URL")
+                it_url = it.get("URL")
                 year = None
-                issued = it.get("issued", {}).get("date-parts", [])
+                issued = (it.get("issued") or {}).get("date-parts", [])
                 if issued and issued[0]:
                     year = issued[0][0]
-                if title and url:
-                    out.append({ "title": title.strip(), "url": url, "year": year, "source": "Crossref" })
+                if title and it_url:
+                    out.append({ "title": title.strip(), "url": it_url, "year": year, "source": "Crossref" })
     except Exception as e:
         print("Crossref error:", e)
     return out
 
 def fetch_arxiv(query: str, max_results: int = 6):
-    q = f"http://export.arxiv.org/api/query?search_query=all:{requests.utils.quote(query)}&start=0&max_results={max_results}"
+    # Don't pass URL to feedparser.parse directly — it has no timeout and can hang for minutes.
+    # Fetch with requests (bounded timeout), then parse the bytes.
+    url = "http://export.arxiv.org/api/query"
+    params = {"search_query": f"all:{query}", "start": 0, "max_results": max_results}
     out = []
     try:
-        feed = feedparser.parse(q)
+        r = requests.get(url, params=params, timeout=6)
+        if not r.ok:
+            return out
+        feed = feedparser.parse(r.content)
         for entry in feed.entries:
-            title = entry.get("title", "").strip()
+            title = (entry.get("title") or "").strip()
             link = entry.get("link")
             year = None
-            if entry.get("published"):
-                year = entry.published[:4]
+            published = entry.get("published")
+            if published:
+                year = published[:4]
             if title and link:
                 out.append({
                     "title": title,
@@ -167,31 +204,61 @@ def call_model_map(topic: str, context_text: str) -> dict:
         n.setdefault("label", n.get("id","")); n.setdefault("summary", ""); n.setdefault("sources", [])
     return data
 
+
+# ------------- speed-first map generator (no Crossref/arXiv/Wiki calls) -------------
+def call_model_map_light(topic: str) -> dict:
+    """Fast: just nodes + links. No external grounding."""
+    system_msg = (
+        "You create compact concept maps for a research topic.\n"
+        "Return ONLY JSON with keys: nodes (array), links (array), gaps (array).\n"
+        "Each node: {\"id\": string, \"label\": string, \"val\": number, \"color\": string, \"summary\": string}.\n"
+        "10–20 nodes max. Short, precise, non-duplicative labels. 'val' ~ 4..12. Keep summaries 1 sentence max."
+    )
+    user_msg = (
+        f"TOPIC:\n{topic}\n\n"
+        "OUTPUT: JSON only. No prose, no markdown."
+    )
+
+    chat = client.chat.completions.create(
+        model=MODEL_NAME,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system_msg},
+                  {"role": "user", "content": user_msg}]
+    )
+    raw = chat.choices[0].message.content or "{}"
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+    data = safe_json_loads(raw, default={}) or {}
+    data.setdefault("nodes", []); data.setdefault("links", []); data.setdefault("gaps", [])
+    for n in data["nodes"]:
+        n.setdefault("val", 6)
+        n.setdefault("color", "#58c7ff")
+        n.setdefault("label", n.get("id",""))
+        n.setdefault("summary", "")
+        n.setdefault("sources", [])
+    return data
+
+
 # ---------------------------
 # Dossier (strict spec) + robust fallback
 # ---------------------------
 SYSTEM_DOSSIER = """You are a research assistant that writes compact, grounded dossiers for a subtopic node.
 
-Return ONLY JSON with keys:
-- id: string (node id)
-- label: string (human-friendly)
-- definition: string (2–4 sentences)
-- key_ideas: array of 3–7 short strings
-- aliases: array of 0–6 short strings
-- papers: array of 4–6 objects, each:
-    {title: string, year: number, url: string, reason: string}
-    Include ~2 seminal (older, widely-cited) and ~3 recent (last 5–7 years) where possible.
-- quotes: array of 0–3 objects, each:
-    {quote: string, source_title: string, url: string}
-    Keep quotes ≤200 chars and pull from provided sources when possible.
-- datasets_tools: array of 0–6 objects, each:
-    {name: string, url: string, note: string}
-- controversies: array of 0–6 short strings
-- search_prompts: array of 3–8 queries (strings) people can paste into Google/Scholar
-- timeline: array of 0–6 objects, each:
-    {year: number, event: string}
+CRITICAL CONSTRAINTS:
+- The dossier MUST be about the NODE as it relates to the TOPIC. If the node label is ambiguous, choose the interpretation consistent with the TOPIC and standard usage in that field.
+- Do NOT drift to unrelated meanings (e.g., chemical N4 when the topic is Quantum Physics).
+- Prefer information aligned with the provided WIKIPEDIA CONTEXTS and ARTICLES; if unsure, state uncertainty briefly rather than inventing.
 
-Be precise, avoid fluff, prefer the ARTICLES provided. If unsure, state uncertainty briefly rather than hallucinating.
+Return ONLY JSON with keys:
+- id, label, definition (2–4 sentences)
+- key_ideas (3–7)
+- aliases (0–6)
+- papers (4–6) each {title, year, url, reason}
+- quotes (0–3) {quote, source_title, url} (≤200 chars)
+- datasets_tools (0–6) {name, url, note}
+- controversies (0–6)
+- search_prompts (3–8)
+- timeline (0–6) {year, event}
 """
 
 def build_user_prompt(topic: str, node_id: str, context_text: str, articles: list[dict]) -> str:
@@ -249,7 +316,9 @@ def call_model_dossier(topic: str, node_id: str, context_text: str) -> dict:
     data = safe_json_loads(raw, default={}) or {}
 
     dossier = {
-        "id": data.get("id") or node_id,
+        # Always pin the id to the requested node so the frontend cache key matches,
+        # regardless of whatever the LLM hallucinates here.
+        "id": node_id,
         "label": data.get("label") or node_id,
         "definition": data.get("definition") or "",
         "key_ideas": data.get("key_ideas") or [],
@@ -293,6 +362,231 @@ def call_model_dossier(topic: str, node_id: str, context_text: str) -> dict:
 
     return dossier
 
+# =============================================================================
+# Dossier cache + background prefetch pipeline
+# =============================================================================
+# Strategy:
+#   1. /map kicks off a background "phase 1" dossier (LLM-only, no external I/O)
+#      for every node, capped by a semaphore. Phase 1 lands in _DOSSIER_CACHE
+#      within ~3-8s per node, so by the time the user clicks anything most
+#      nodes are already populated.
+#   2. After phase 1 lands for a node, a separate "phase 2" task fires that
+#      hits Crossref + arXiv in parallel and merges papers into the cached
+#      dossier. The user sees the partial first, then sources fill in on the
+#      next read.
+#   3. /node either returns the cache hit, awaits an in-flight task, or
+#      synthesizes on the spot if neither.
+#
+# Cache key is (topic_lower, node_id_lower). Topics cancel previous topics'
+# in-flight tasks to free up the semaphore.
+# =============================================================================
+
+def _dkey(topic: str, node_id: str) -> tuple[str, str]:
+    return (topic.strip().lower(), node_id.strip().lower())
+
+_DOSSIER_CACHE: dict[tuple[str, str], dict] = {}
+_DOSSIER_INFLIGHT: dict[tuple[str, str], "asyncio.Task"] = {}
+_TOPIC_TASKS: dict[str, list["asyncio.Task"]] = {}
+
+# Phase 1 (OpenAI calls): cap concurrency to avoid rate-limiting and overload.
+_PHASE1_SEM: "asyncio.Semaphore | None" = None
+# Phase 2 (Crossref + arXiv): more permissive, mostly I/O wait.
+_PHASE2_SEM: "asyncio.Semaphore | None" = None
+
+def _get_sems() -> tuple["asyncio.Semaphore", "asyncio.Semaphore"]:
+    """Lazy-create semaphores so they bind to the running event loop."""
+    global _PHASE1_SEM, _PHASE2_SEM
+    if _PHASE1_SEM is None:
+        _PHASE1_SEM = asyncio.Semaphore(5)
+    if _PHASE2_SEM is None:
+        _PHASE2_SEM = asyncio.Semaphore(8)
+    return _PHASE1_SEM, _PHASE2_SEM
+
+
+# ---- Phase 1: LLM-only dossier (no external I/O) ----------------------------
+SYSTEM_DOSSIER_FAST = """You are a research assistant writing a compact dossier for a NODE inside a TOPIC.
+
+CRITICAL CONSTRAINTS:
+- Disambiguate the NODE in the context of the TOPIC. Do NOT drift to unrelated meanings.
+- Be concise and factual. If unsure about a fact, omit it.
+- Do NOT invent papers, quotes, URLs, or datasets. Those will be added later by an external source step.
+
+Return ONLY JSON with these keys (omit none):
+- label: short human-friendly label (string)
+- definition: 2-4 sentence plain-language definition (string)
+- key_ideas: 3-7 short bullet strings (array of strings)
+- aliases: 0-6 alternative names/abbrevs (array of strings)
+- controversies: 0-6 short bullet strings (array of strings)
+- search_prompts: 3-8 specific google-able query strings (array of strings)
+- timeline: 0-6 entries each {year:int, event:string} (array)
+"""
+
+def call_model_dossier_fast_sync(topic: str, node_id: str) -> dict:
+    user_msg = (
+        f"TOPIC: {topic}\n"
+        f"NODE:  {node_id}\n\n"
+        "OUTPUT: JSON only. No prose, no markdown, no code fences."
+    )
+    chat = client.chat.completions.create(
+        model=MODEL_NAME,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_DOSSIER_FAST},
+            {"role": "user", "content": user_msg}
+        ],
+    )
+    raw = chat.choices[0].message.content or "{}"
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+    data = safe_json_loads(raw, default={}) or {}
+
+    # Normalize timeline years to ints when possible.
+    timeline = []
+    for t in (data.get("timeline") or []):
+        if not isinstance(t, dict): continue
+        y = t.get("year")
+        try:
+            y = int(y) if y is not None else None
+        except Exception:
+            y = None
+        timeline.append({"year": y, "event": str(t.get("event") or "")})
+
+    return {
+        "id": node_id,
+        "label": data.get("label") or node_id,
+        "definition": data.get("definition") or "",
+        "key_ideas": [str(x) for x in (data.get("key_ideas") or [])],
+        "aliases": [str(x) for x in (data.get("aliases") or [])],
+        "papers": [],            # filled by phase 2
+        "quotes": [],            # filled by phase 2 (best effort)
+        "datasets_tools": [],    # filled by phase 2 (best effort)
+        "controversies": [str(x) for x in (data.get("controversies") or [])],
+        "search_prompts": [str(x) for x in (data.get("search_prompts") or [])],
+        "timeline": timeline,
+        "_phase1_done": True,
+        "_enriched": False,
+    }
+
+
+# ---- Phase 2: parallel sources fetch + merge --------------------------------
+def _fetch_sources_parallel(query: str, max_each: int = 6) -> list[dict]:
+    """Crossref + arXiv concurrently in a small thread pool. Bounded latency."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(fetch_crossref, query, max_each)
+        f2 = ex.submit(fetch_arxiv, query, max_each)
+        cross = f1.result() or []
+        arx = f2.result() or []
+    seen = set(); merged = []
+    for s in cross + arx:
+        k = (s["title"].lower(), s["url"])
+        if k in seen: continue
+        seen.add(k); merged.append(s)
+    return merged
+
+def enrich_dossier_with_sources_sync(topic: str, node_id: str, base: dict) -> dict:
+    """Add papers (and a tiny datasets_tools heuristic) without re-calling the LLM."""
+    sources = _fetch_sources_parallel(f"{node_id} {topic}", max_each=6)
+    papers = []
+    for s in sources[:6]:
+        papers.append({
+            "title": s["title"],
+            "year": s.get("year"),
+            "url": s["url"],
+            "reason": f"Source from {s.get('source','external')} matching '{node_id}' in '{topic}'.",
+        })
+    out = dict(base)  # don't mutate cached object inplace until ready
+    out["papers"] = papers
+    # Heuristic timeline if model gave none and we have years.
+    if not out.get("timeline"):
+        years = sorted({p["year"] for p in papers if p.get("year")})
+        out["timeline"] = [{"year": int(y), "event": f"Notable publication related to {node_id}"} for y in years[:6]]
+    out["_enriched"] = True
+    return out
+
+
+# ---- Async pipeline + cache plumbing ----------------------------------------
+async def _phase1_async(topic: str, node_id: str) -> dict:
+    sem1, _ = _get_sems()
+    async with sem1:
+        try:
+            return await asyncio.to_thread(call_model_dossier_fast_sync, topic, node_id)
+        except Exception as e:
+            print(f"[dossier:phase1] LLM failed for {node_id!r}: {e!r}")
+            ctx = await asyncio.to_thread(fetch_context, topic)
+            fb = await asyncio.to_thread(_fallback_dossier, topic, node_id, ctx)
+            fb.setdefault("_phase1_done", True)
+            fb.setdefault("_enriched", False)
+            return fb
+
+async def _phase2_async(topic: str, node_id: str) -> None:
+    """Enrich the cached dossier in-place with sources. Best effort."""
+    _, sem2 = _get_sems()
+    key = _dkey(topic, node_id)
+    base = _DOSSIER_CACHE.get(key)
+    if not base or base.get("_enriched"):
+        return
+    async with sem2:
+        try:
+            enriched = await asyncio.to_thread(enrich_dossier_with_sources_sync, topic, node_id, base)
+            _DOSSIER_CACHE[key] = enriched
+        except Exception as e:
+            print(f"[dossier:phase2] enrichment failed for {node_id!r}: {e!r}")
+
+async def _generate_dossier(topic: str, node_id: str) -> dict:
+    key = _dkey(topic, node_id)
+    if key in _DOSSIER_CACHE:
+        return _DOSSIER_CACHE[key]
+    dossier = await _phase1_async(topic, node_id)
+    _DOSSIER_CACHE[key] = dossier
+    # Fire phase 2 without awaiting: cache will update when done.
+    t2 = asyncio.create_task(_phase2_async(topic, node_id))
+    _TOPIC_TASKS.setdefault(topic.strip().lower(), []).append(t2)
+    return dossier
+
+async def _get_or_create_dossier(topic: str, node_id: str) -> dict:
+    """Cache hit, await in-flight, or generate fresh."""
+    key = _dkey(topic, node_id)
+    if key in _DOSSIER_CACHE:
+        return _DOSSIER_CACHE[key]
+    inflight = _DOSSIER_INFLIGHT.get(key)
+    if inflight is not None:
+        try:
+            await inflight
+        except Exception:
+            pass
+        if key in _DOSSIER_CACHE:
+            return _DOSSIER_CACHE[key]
+    task = asyncio.create_task(_generate_dossier(topic, node_id))
+    _DOSSIER_INFLIGHT[key] = task
+    task.add_done_callback(lambda _t, k=key: _DOSSIER_INFLIGHT.pop(k, None))
+    _TOPIC_TASKS.setdefault(topic.strip().lower(), []).append(task)
+    return await task
+
+def _cancel_other_topics(current_topic: str) -> None:
+    """When a new topic is generated, cancel prefetches for older topics so the
+    semaphore isn't blocked. Already-completed tasks are no-ops."""
+    cur = current_topic.strip().lower()
+    for t, tasks in list(_TOPIC_TASKS.items()):
+        if t == cur: continue
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        _TOPIC_TASKS.pop(t, None)
+
+def _spawn_prefetch_for_map(topic: str, nodes: list[dict]) -> None:
+    """Schedule background dossier generation for every node in the map."""
+    for n in nodes:
+        nid = n.get("id")
+        if not nid: continue
+        key = _dkey(topic, nid)
+        if key in _DOSSIER_CACHE or key in _DOSSIER_INFLIGHT:
+            continue
+        task = asyncio.create_task(_generate_dossier(topic, nid))
+        _DOSSIER_INFLIGHT[key] = task
+        task.add_done_callback(lambda _t, k=key: _DOSSIER_INFLIGHT.pop(k, None))
+        _TOPIC_TASKS.setdefault(topic.strip().lower(), []).append(task)
+
+
 # ---------------------------
 # Routes
 # ---------------------------
@@ -301,10 +595,9 @@ def health():
     return {"status": "ok", "model": MODEL_NAME}
 
 @app.get("/map")
-def map_endpoint(topic: str = Query(..., min_length=2, max_length=120)):
-    ctx = fetch_context(topic)
+async def map_endpoint(topic: str = Query(..., min_length=2, max_length=120)):
     try:
-        data = call_model_map(topic, ctx)
+        data = await asyncio.to_thread(call_model_map_light, topic)
     except Exception as e:
         print("OpenAI map call failed:", repr(e))
         data = {
@@ -313,30 +606,77 @@ def map_endpoint(topic: str = Query(..., min_length=2, max_length=120)):
             "gaps": []
         }
         if DEV_MODE: data["error"] = str(e)
+
     nodes = data.get("nodes", []); links = data.get("links", [])
     if not nodes:
         nodes = [{"id": topic, "label": topic, "val": 10, "color": "#00ff88"}]
+
+    # Dedupe nodes by id (3d-force-graph crashes on duplicates), keep first occurrence.
+    seen_ids = set()
+    deduped = []
     for n in nodes:
-        n.setdefault("val", 6); n.setdefault("color", "#58c7ff"); n.setdefault("label", n.get("id",""))
-    data["nodes"], data["links"] = nodes, links
+        nid = n.get("id")
+        if not nid or nid in seen_ids:
+            continue
+        seen_ids.add(nid)
+        n.setdefault("val", 6)
+        n.setdefault("color", "#58c7ff")
+        n.setdefault("label", n.get("id",""))
+        n.setdefault("summary", "")
+        n.setdefault("sources", [])
+        deduped.append(n)
+
+    # Drop links whose endpoints were dropped/never existed.
+    valid_links = [l for l in links
+                   if isinstance(l, dict)
+                   and l.get("source") in seen_ids
+                   and l.get("target") in seen_ids]
+
+    data["nodes"], data["links"] = deduped, valid_links
     data.setdefault("gaps", [])
+
+    # Free up the semaphore from any older topic that's still prefetching,
+    # then warm every node of the new topic in the background.
+    _cancel_other_topics(topic)
+    _spawn_prefetch_for_map(topic, deduped)
+
     return data
 
+
 @app.get("/node")
-def node_dossier(
+async def node_dossier(
     topic: str = Query(..., min_length=2, max_length=120),
     id: str = Query(..., min_length=1, max_length=160)
 ):
-    ctx = fetch_context(topic)
     try:
-        dossier = call_model_dossier(topic, id, ctx)
+        dossier = await _get_or_create_dossier(topic, id)
         return {"topic": topic, "id": id, "dossier": dossier}
     except Exception as e:
-        print("LLM dossier call failed; using fallback:", repr(e))
-        fallback = _fallback_dossier(topic, id, ctx)
+        print("Dossier pipeline failed; using fallback:", repr(e))
+        ctx = await asyncio.to_thread(fetch_context, topic)
+        fallback = await asyncio.to_thread(_fallback_dossier, topic, id, ctx)
         resp = {"topic": topic, "id": id, "dossier": fallback}
         if DEV_MODE: resp["error"] = f"fallback:{e}"
         return resp
+
+
+@app.get("/node/status")
+async def node_status(
+    topic: str = Query(..., min_length=2, max_length=120),
+    id: str = Query(..., min_length=1, max_length=160),
+):
+    """Tiny endpoint for the frontend to poll for the enriched (phase 2) version
+    after it has shown the phase 1 result. Cheap: just a dict lookup."""
+    key = _dkey(topic, id)
+    cached = _DOSSIER_CACHE.get(key)
+    if cached:
+        return {
+            "topic": topic, "id": id,
+            "phase1_done": bool(cached.get("_phase1_done")),
+            "enriched": bool(cached.get("_enriched")),
+            "dossier": cached,
+        }
+    return {"topic": topic, "id": id, "phase1_done": False, "enriched": False, "dossier": None}
 
 @app.get("/models")
 def list_models():

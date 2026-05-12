@@ -27,6 +27,23 @@ const Graph = ForceGraph3D()(document.getElementById("graph"))
 
 Graph.onNodeClick(node => showCard(node)); // lazy dossier load on click
 
+// Hover prefetch: kick off the dossier request after a short hover so the
+// click is instant if the user actually clicks. Backend caches it, so this
+// is at most one extra request per hovered node per session.
+let hoverTimer = null;
+const HOVER_DEBOUNCE_MS = 250;
+Graph.onNodeHover(node => {
+  if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+  if (!node || !CURRENT_TOPIC) return;
+  const key = cacheKey(CURRENT_TOPIC, node.id);
+  if (dossierCache.has(key)) return;
+  hoverTimer = setTimeout(() => {
+    fetchDossier(CURRENT_TOPIC, node.id)
+      .then(payload => { if (payload && payload.dossier) dossierCache.set(key, payload); })
+      .catch(() => {}); // silent: hover prefetch is best-effort
+  }, HOVER_DEBOUNCE_MS);
+});
+
 // ============================
 // Space background + lights
 // ============================
@@ -38,10 +55,10 @@ setupLights(Graph);
 // ============================
 const starterData = {
   nodes: [
-    { id: "MindMesh", label: "MindMesh", val: 12, color: "#00ff88" },
+    { id: "Cluster", label: "Cluster", val: 12, color: "#00ff88" },
     { id: "Type a topic ↑", label: "Type a topic ↑", val: 6, color: "#58c7ff" }
   ],
-  links: [{ source: "MindMesh", target: "Type a topic ↑" }]
+  links: [{ source: "Cluster", target: "Type a topic ↑" }]
 };
 Graph.graphData(starterData);
 
@@ -199,6 +216,30 @@ async function fetchDossier(topic, id, { signal } = {}) {
   return res.json(); // { topic, id, dossier, error? }
 }
 
+async function fetchDossierStatus(topic, id, { signal } = {}) {
+  const url = `${API_BASE}/node/status?topic=${encodeURIComponent(topic)}&id=${encodeURIComponent(id)}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+  return res.json(); // { topic, id, phase1_done, enriched, dossier }
+}
+
+// Poll /node/status until the dossier is enriched (papers added). Bounded.
+async function pollEnrichment(topic, id, controller) {
+  const maxAttempts = 6;
+  const intervalMs = 1500;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    if (controller.signal.aborted) return null;
+    try {
+      const status = await fetchDossierStatus(topic, id, { signal: controller.signal });
+      if (status && status.enriched && status.dossier) return status.dossier;
+    } catch {
+      // ignore transient errors
+    }
+  }
+  return null;
+}
+
 function setLoading(loading) {
   generateBtn.disabled = loading;
   generateBtn.textContent = loading ? "Generating…" : "Generate Map";
@@ -289,17 +330,38 @@ async function showCard(node) {
     return;
   }
 
+  // Capture our own controller so we can detect if a newer click has replaced us.
+  const myController = new AbortController();
   if (dossierAbort) dossierAbort.abort();
-  dossierAbort = new AbortController();
+  dossierAbort = myController;
 
   try {
-    const payload = await fetchDossier(topic, node.id, { signal: dossierAbort.signal });
+    const payload = await fetchDossier(topic, node.id, { signal: myController.signal });
     dossierCache.set(key, payload);
+    // Only render if we're still the active request (a newer click would have replaced dossierAbort).
+    if (dossierAbort !== myController) return;
     cardSummary.textContent = "";           // ⬅ clear placeholder
     renderDossier(payload.dossier);
+
+    // If the dossier hasn't been enriched yet (no papers from external sources),
+    // poll the backend for the phase-2 update and re-render papers when ready.
+    const needsEnrich = !payload.dossier
+      || !Array.isArray(payload.dossier.papers)
+      || payload.dossier.papers.length === 0;
+    if (needsEnrich) {
+      pollEnrichment(topic, node.id, myController).then(enriched => {
+        if (!enriched) return;
+        if (dossierAbort !== myController && dossierAbort !== null) return;
+        // Update cache with the enriched dossier (preserve the wrapper shape).
+        dossierCache.set(key, { ...payload, dossier: enriched });
+        // Re-render only the fields that phase-2 fills in (avoid clobbering user scroll).
+        renderDossier(enriched);
+      });
+    }
   } catch (err) {
     if (err.name === "AbortError") return;
     console.error("[dossier] fetch failed", err);
+    if (dossierAbort !== myController) return;
     cardSummary.textContent = node.summary || "No summary available.";
     if (Array.isArray(node.sources) && node.sources.length) {
       cardPapers.innerHTML = node.sources.map(s => {
@@ -310,8 +372,11 @@ async function showCard(node) {
       }).join("");
     }
   } finally {
-    setAllTabsLoading(false);
-    if (dossierAbort && dossierAbort.signal.aborted === false) dossierAbort = null;
+    // Only hide the loading bar / null the controller if we're still the active request.
+    if (dossierAbort === myController) {
+      setAllTabsLoading(false);
+      dossierAbort = null;
+    }
   }
 }
 
